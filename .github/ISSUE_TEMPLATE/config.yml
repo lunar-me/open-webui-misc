@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Open WebUI
+    url: https://github.com/open-webui/open-webui
+    about: For issues with Open WebUI itself, please open an issue in the main Open WebUI repository.

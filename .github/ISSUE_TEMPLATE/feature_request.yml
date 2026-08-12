@@ -1,0 +1,39 @@
+name: 💡 Feature Request
+description: Suggest a new skill or improvement for this repository
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a new feature! Please describe your idea clearly so we can evaluate it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What problem would this feature solve, or what would it enable?
+      placeholder: Describe the use case or gap you're addressing...
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: What should be added or changed?
+      placeholder: Describe your proposed skill or improvement...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative approaches you've thought of?
+    validations:
+      required: false
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other relevant information, links, or examples.
+    validations:
+      required: false
