@@ -54,6 +54,46 @@ git clone https://github.com/lunar-me/open-webui-misc.git
 
 Each prompt focuses on **motion and temporal change** — subject movement, expressions, gestures, environmental activity, lighting changes, and natural camera behavior — rather than redesigning the scene.
 
+## 🛠️ Useful Scripts
+
+### `image_chat.py`
+
+A Python script that sends an image (plus optional text and configured Open WebUI tools/skills) to a local Open WebUI instance and saves the model's reply as a Markdown file.
+
+**Workflow** (per [`docs/api-endpoints.md`](docs/api-endpoints.md)):
+
+1. Upload the image → `POST /api/v1/files/`
+2. Wait for processing → `GET /api/v1/files/{id}/process/status`
+3. Chat with the file + tools/skills → `POST /api/chat/completions`
+4. Save the reply as a `.md` file
+
+**Prerequisites:**
+
+- Python 3.10+ with the `requests` library (`pip install requests`)
+- A running local Open WebUI instance
+- An API key (from **Settings > Account** in Open WebUI)
+
+**Usage:**
+
+```bash
+# Chat with an image + tool + skill
+python image_chat.py path/to/image.png \
+    --tool-id server:mcp:YOUR_MCP_SERVER_ID \
+    --skill-id YOUR_SKILL_ID \
+    --text "Describe this image" \
+    --model qwen3.6:27b \
+    --api-key YOUR_API_KEY \
+    --output result.md
+
+# List all available tools (IDs, names, descriptions)
+python image_chat.py --list-tools --api-key YOUR_API_KEY
+
+# List all available skills (IDs, names, descriptions)
+python image_chat.py --list-skills --api-key YOUR_API_KEY
+```
+
+**Configuration via `.env`:** Copy [`.env.example`](.env.example) to `.env` and fill in your values. The script automatically loads `OPEN_WEBUI_API_KEY`, `OPEN_WEBUI_BASE_URL`, `OPEN_WEBUI_MODEL`, `OPEN_WEBUI_TOOL_ID`, `OPEN_WEBUI_SKILL_ID`, `OPEN_WEBUI_POLL_INTERVAL`, and `OPEN_WEBUI_TIMEOUT`. CLI flags override `.env` values.
+
 ## 🗂️ Repository Structure
 
 ```
@@ -63,8 +103,12 @@ Each prompt focuses on **motion and temporal change** — subject movement, expr
 │   ├── dynamic-action-video-prompts.md            # Dynamic action scene prompt generator
 │   ├── candid-video-prompts-MiniMaxH3.md          # Candid motion + audio prompt generator (MiniMax H3)
 │   └── dynamic-action-video-prompts-MiniMaxH3.md  # Dynamic action + sound prompt generator (MiniMax H3)
+├── docs/
+│   └── api-endpoints.md                          # Open WebUI API endpoint reference
+├── .env.example                                  # Example environment configuration
 ├── .github/                             # GitHub community health files
 ├── .gitignore
+├── image_chat.py                                 # Image + tool/skill chat script
 ├── LICENSE
 └── README.md
 ```

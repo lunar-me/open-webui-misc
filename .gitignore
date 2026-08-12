@@ -22,3 +22,10 @@ desktop.ini
 node_modules/
 dist/
 build/
+webui-docs/
+
+# Python
+__pycache__/
+*.py[cod]
+
+.env
