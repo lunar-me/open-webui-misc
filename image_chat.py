@@ -4,11 +4,17 @@ Sample script: send an image + optional text + configured Open WebUI tools
 and/or skills to a local Open WebUI instance, and save the model's reply as
 a Markdown file.
 
-Workflow (per api-endpoints.md):
-  1. Upload the image   -> POST /api/v1/files/
-  2. Wait for processing -> GET /api/v1/files/{id}/process/status
-  3. Chat with the file + tools/skills -> POST /api/chat/completions
-  4. Save the reply as a .md file
+Workflow:
+  1. Encode the image as an inline base64 data URI
+  2. Chat with the image + tools/skills -> POST /api/chat/completions
+  3. Save the reply as a .md file
+
+The image is always embedded inline as base64 directly in the chat message
+(standard OpenAI vision 'image_url' format). This is near-instant — there is
+no upload, no server-side file processing (OCR/embeddings), and no polling —
+and it guarantees the model receives the actual image rather than the file's
+text representation (which appears as garbled binary on some cloud vision
+models).
 
 Usage:
   python image_chat.py path/to/image.png \
@@ -31,18 +37,17 @@ List all available skills (IDs, names, descriptions):
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import mimetypes
 import os
 import sys
-import time
 from pathlib import Path
 
 import requests
 
 DEFAULT_BASE_URL = "http://localhost:3000"
 DEFAULT_MODEL = "qwen3.6:27b"
-DEFAULT_POLL_INTERVAL = 2.0
-DEFAULT_TIMEOUT = 300.0
 
 ENV_FILE = ".env"
 ENV_VARS = (
@@ -51,21 +56,12 @@ ENV_VARS = (
     "OPEN_WEBUI_MODEL",
     "OPEN_WEBUI_TOOL_ID",
     "OPEN_WEBUI_SKILL_ID",
-    "OPEN_WEBUI_POLL_INTERVAL",
-    "OPEN_WEBUI_TIMEOUT",
+    "OPEN_WEBUI_LOG",
 )
 
 
 class OpenWebUIClientError(Exception):
     """Base error for Open WebUI API failures."""
-
-
-class FileUploadError(OpenWebUIClientError):
-    """Raised when uploading a file fails."""
-
-
-class FileProcessingError(OpenWebUIClientError):
-    """Raised when file processing fails or times out."""
 
 
 class ChatCompletionError(OpenWebUIClientError):
@@ -78,6 +74,10 @@ class ToolsListError(OpenWebUIClientError):
 
 class SkillsListError(OpenWebUIClientError):
     """Raised when listing skills fails."""
+
+
+class ModelNotFoundError(OpenWebUIClientError):
+    """Raised when the requested model does not exist on the server."""
 
 
 def load_env(env_file: Path | str = Path(ENV_FILE)) -> None:
@@ -186,16 +186,11 @@ def parse_args() -> argparse.Namespace:
         help="Output .md file path (default: <image_stem>.md next to the image).",
     )
     parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=float(os.environ.get("OPEN_WEBUI_POLL_INTERVAL", DEFAULT_POLL_INTERVAL)),
-        help=f"Poll interval seconds while waiting for file processing (default: {DEFAULT_POLL_INTERVAL}).",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=float(os.environ.get("OPEN_WEBUI_TIMEOUT", DEFAULT_TIMEOUT)),
-        help=f"Max seconds to wait for file processing (default: {DEFAULT_TIMEOUT}).",
+        "--log",
+        action="store_true",
+        default=os.environ.get("OPEN_WEBUI_LOG", "").lower() in ("1", "true", "yes", "on"),
+        help="Write an interaction log (input, thoughts, output) to <image_stem>.log. "
+        "Enabled by default when OPEN_WEBUI_LOG is set to 1/true/yes/on.",
     )
     if len(sys.argv) < 2:
         # No arguments supplied: show help instead of an error.
@@ -296,96 +291,144 @@ def list_skills(base_url: str, token: str) -> None:
     _print_items(items, "skill")
 
 
-def upload_file(base_url: str, headers: dict, image_path: Path) -> str:
-    """Upload an image and return its file ID."""
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Image file not found: {image_path}")
+def validate_model(base_url: str, headers: dict, model: str) -> None:
+    """
+    Fast check that the requested model exists on the server BEFORE any
+    expensive work (file encoding) is done.
 
-    url = f"{base_url}/api/v1/files/"
-    with open(image_path, "rb") as fh:
-        files = {"file": (image_path.name, fh)}
-        try:
-            resp = requests.post(url, headers=headers, files=files, timeout=60)
-        except requests.RequestException as exc:
-            raise FileUploadError(f"Network error while uploading file: {exc}") from exc
+    Raises ModelNotFoundError if the model is not in GET /api/models.
+    """
+    url = f"{base_url}/api/models"
+    try:
+        resp = requests.get(url, headers=headers, timeout=60)
+    except requests.RequestException as exc:
+        raise OpenWebUIClientError(f"Network error while checking models: {exc}") from exc
 
     if resp.status_code != 200:
-        raise FileUploadError(
-            f"Upload failed with HTTP {resp.status_code}: {resp.text}"
+        raise OpenWebUIClientError(
+            f"Model list failed with HTTP {resp.status_code}: {resp.text}"
         )
 
     try:
         data = resp.json()
     except json.JSONDecodeError as exc:
-        raise FileUploadError(f"Upload returned invalid JSON: {resp.text}") from exc
+        raise OpenWebUIClientError(f"Model list returned invalid JSON: {resp.text}") from exc
 
-    file_id = data.get("id")
-    if not file_id:
-        raise FileUploadError(f"Upload response missing 'id': {data}")
-    return file_id
+    # Open WebUI returns {"data": [{"id": "...", ...}, ...]}.
+    models = data.get("data", []) if isinstance(data, dict) else []
+    model_ids: set[str] = set()
+    for m in models:
+        if isinstance(m, dict):
+            mid = m.get("id")
+            if isinstance(mid, str):
+                model_ids.add(mid)
+
+    if model not in model_ids:
+        if model_ids:
+            available = "\n  - " + "\n  - ".join(sorted(model_ids))
+        else:
+            available = "\n  (none)"
+        raise ModelNotFoundError(
+            f"Model '{model}' not found.\nAvailable models:{available}"
+        )
 
 
-def wait_for_file_processing(
-    base_url: str,
-    headers: dict,
-    file_id: str,
-    poll_interval: float,
-    timeout: float,
-) -> None:
-    """Poll the processing-status endpoint until the file is ready or fails."""
-    url = f"{base_url}/api/v1/files/{file_id}/process/status"
-    start = time.time()
+def detect_mime_type(path: Path) -> str:
+    """
+    Determine the image MIME type from the file extension, falling back to
+    magic-byte sniffing so base64 data URIs are always well-formed.
+    """
+    mime, _ = mimetypes.guess_type(path.name)
+    if mime and mime.startswith("image/"):
+        return mime
 
-    while time.time() - start < timeout:
-        try:
-            resp = requests.get(url, headers=headers, timeout=60)
-        except requests.RequestException as exc:
-            raise FileProcessingError(
-                f"Network error while checking processing status: {exc}"
-            ) from exc
+    head = path.read_bytes()[:16]
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return "image/gif"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
 
-        if resp.status_code != 200:
-            raise FileProcessingError(
-                f"Status check failed with HTTP {resp.status_code}: {resp.text}"
-            )
+    return mime or "application/octet-stream"
 
-        try:
-            data = resp.json()
-        except json.JSONDecodeError as exc:
-            raise FileProcessingError(
-                f"Status response invalid JSON: {resp.text}"
-            ) from exc
 
-        status = data.get("status")
-        if status == "completed":
-            return
-        if status == "failed":
-            raise FileProcessingError(
-                f"File processing failed: {data.get('error', 'unknown error')}"
-            )
-        time.sleep(poll_interval)
+def encode_image_data_uri(path: Path) -> str:
+    """
+    Read an image file and return a base64 data URI suitable for an OpenAI
+    'image_url' content part, e.g. data:image/jpeg;base64,/9j/4AAQ...
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"Image file not found: {path}")
+    mime = detect_mime_type(path)
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
 
-    raise FileProcessingError(
-        f"Timed out after {timeout}s waiting for file processing to complete."
-    )
+
+def build_multimodal_content(text: str, image_data_uri: str) -> list:
+    """
+    Build the 'content' field for the user message as structured multimodal
+    parts (OpenAI vision format): a text part plus an inline image_url part.
+    """
+    return [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": image_data_uri}},
+    ]
+
+
+def _extract_thoughts(message: dict) -> str:
+    """
+    Extract the model's reasoning/thinking text from an assistant message.
+
+    Handles both flat fields ('reasoning', 'reasoning_content') and
+    structured content blocks (type 'thinking' / 'reasoning' / 'analysis').
+    Returns an empty string when no thoughts are present.
+    """
+    parts: list[str] = []
+
+    for key in ("reasoning", "reasoning_content", "thinking"):
+        val = message.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
+
+    content = message.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype in ("thinking", "reasoning", "analysis"):
+                btext = block.get("text") or block.get("content") or block.get("thinking")
+                if isinstance(btext, str) and btext.strip():
+                    parts.append(btext.strip())
+
+    return "\n\n".join(parts)
 
 
 def chat_completion(
     base_url: str,
     headers: dict,
     model: str,
-    file_id: str,
-    text: str,
-    tool_ids: list[str],
-    skill_ids: list[str],
-) -> str:
-    """Call /api/chat/completions with the file + tools/skills and return the reply text."""
+    user_content: str | list,
+    *,
+    tool_ids: list[str] | None = None,
+    skill_ids: list[str] | None = None,
+) -> tuple[str, str]:
+    """
+    Call /api/chat/completions with the user message + tools/skills.
+
+    `user_content` is passed through as structured multimodal content
+    (text + inline base64 image_url).
+
+    Returns a (reply_text, thoughts_text) tuple. thoughts_text is the model's
+    reasoning/thinking (may be empty if the model does not expose it).
+    """
     url = f"{base_url}/api/chat/completions"
-    content = text if text.strip() else "Describe this image."
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "files": [{"type": "file", "id": file_id}],
+        "messages": [{"role": "user", "content": user_content}],
     }
     if tool_ids:
         payload["tool_ids"] = tool_ids
@@ -407,11 +450,23 @@ def chat_completion(
     except json.JSONDecodeError as exc:
         raise ChatCompletionError(f"Chat completion returned invalid JSON: {resp.text}") from exc
 
-    # Extract the assistant reply text (OpenAI-compatible format).
+    # Extract the assistant reply text + thoughts (OpenAI-compatible format).
     try:
-        return data["choices"][0]["message"]["content"] or ""
+        message = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError) as exc:
         raise ChatCompletionError(f"Unexpected response shape: {data}") from exc
+
+    reply = message.get("content") or ""
+    if isinstance(reply, list):
+        # Structured content blocks: join text blocks.
+        reply = "\n".join(
+            b.get("text", "")
+            for b in reply
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        ).strip()
+
+    thoughts = _extract_thoughts(message)
+    return reply, thoughts
 
 
 def write_markdown(
@@ -434,6 +489,43 @@ def write_markdown(
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(front_matter + reply + "\n", encoding="utf-8")
+
+
+def log_interaction(
+    log_path: Path,
+    image_path: Path,
+    text: str,
+    model: str,
+    tool_ids: list[str],
+    skill_ids: list[str],
+    attachment: str,
+    thoughts: str,
+    reply: str,
+) -> None:
+    """Write a human-readable interaction log: input, thoughts, and output."""
+    lines = [
+        "=" * 60,
+        "Open WebUI interaction log",
+        "=" * 60,
+        "",
+        "--- INPUT ---",
+        f"image : {image_path}",
+        f"attachment : {attachment}",
+        f"model : {model}",
+        f"tools : {', '.join(tool_ids) if tool_ids else '(none)'}",
+        f"skills: {', '.join(skill_ids) if skill_ids else '(none)'}",
+        f"prompt: {text or '(image only)'}",
+        "",
+        "--- THOUGHTS ---",
+        thoughts if thoughts.strip() else "(no reasoning/thoughts returned)",
+        "",
+        "--- OUTPUT ---",
+        reply,
+        "",
+        "=" * 60,
+    ]
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def run_list_tools(args: argparse.Namespace) -> int:
@@ -471,28 +563,28 @@ def run_chat(args: argparse.Namespace) -> int:
         token = resolve_token(args)
         headers = build_headers(token)
 
-        print(f"[1/4] Uploading {args.image} ...")
-        file_id = upload_file(args.base_url, headers, args.image)
-        print(f"      -> file id: {file_id}")
+        print(f"[0/3] Checking model '{args.model}' exists ...")
+        validate_model(args.base_url, headers, args.model)
+        print("      -> model found")
 
-        print("[2/4] Waiting for file processing ...")
-        wait_for_file_processing(
-            args.base_url, headers, file_id, args.poll_interval, args.timeout
-        )
-        print("      -> processing completed")
+        print(f"[1/3] Encoding {args.image} as inline base64 image ...")
+        image_data_uri = encode_image_data_uri(args.image)
+        print(f"      -> {len(image_data_uri)}-char data URI "
+              f"({detect_mime_type(args.image)})")
 
-        print("[3/4] Requesting chat completion with tools/skills ...")
-        reply = chat_completion(
+        print("[2/3] Requesting chat completion with tools/skills ...")
+        default_text = args.text if args.text.strip() else "Describe this image."
+        user_content = build_multimodal_content(default_text, image_data_uri)
+        reply, thoughts = chat_completion(
             args.base_url,
             headers,
             args.model,
-            file_id,
-            args.text,
-            args.tool_id,
-            args.skill_id,
+            user_content,
+            tool_ids=args.tool_id,
+            skill_ids=args.skill_id,
         )
 
-        print(f"[4/4] Writing result to {output_path} ...")
+        print(f"[3/3] Writing result to {output_path} ...")
         write_markdown(
             output_path,
             reply,
@@ -503,10 +595,25 @@ def run_chat(args: argparse.Namespace) -> int:
             args.model,
         )
 
-        print(f"Done. Result saved to: {output_path}")
+        if args.log:
+            log_path = args.image.with_suffix(".log")
+            print(f"      -> writing interaction log to {log_path}")
+            log_interaction(
+                log_path,
+                args.image,
+                args.text,
+                args.model,
+                args.tool_id,
+                args.skill_id,
+                "inline base64 image_url",
+                thoughts,
+                reply,
+            )
+
+        print(f"Done.")
         return 0
 
-    except (FileNotFoundError, ValueError, FileUploadError, FileProcessingError, ChatCompletionError) as exc:
+    except (FileNotFoundError, ValueError, ChatCompletionError, ModelNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except requests.RequestException as exc:

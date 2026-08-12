@@ -62,10 +62,13 @@ A Python script that sends an image (plus optional text and configured Open WebU
 
 **Workflow** (per [`docs/api-endpoints.md`](docs/api-endpoints.md)):
 
-1. Upload the image → `POST /api/v1/files/`
-2. Wait for processing → `GET /api/v1/files/{id}/process/status`
-3. Chat with the file + tools/skills → `POST /api/chat/completions`
-4. Save the reply as a `.md` file
+`image_chat.py` embeds the image inline as base64 directly in the chat message (standard OpenAI vision `image_url` format) — there is no upload, no server-side file processing (OCR/embeddings), and no polling:
+
+1. Encode the image as an inline base64 `image_url`
+2. Chat with the image + tools/skills → `POST /api/chat/completions`
+3. Save the reply as a `.md` file
+
+This is **near-instant** and guarantees the model receives the actual image — not the file's text representation (which appears as garbled binary on some cloud vision models).
 
 **Prerequisites:**
 
@@ -92,7 +95,7 @@ python image_chat.py --list-tools --api-key YOUR_API_KEY
 python image_chat.py --list-skills --api-key YOUR_API_KEY
 ```
 
-**Configuration via `.env`:** Copy [`.env.example`](.env.example) to `.env` and fill in your values. The script automatically loads `OPEN_WEBUI_API_KEY`, `OPEN_WEBUI_BASE_URL`, `OPEN_WEBUI_MODEL`, `OPEN_WEBUI_TOOL_ID`, `OPEN_WEBUI_SKILL_ID`, `OPEN_WEBUI_POLL_INTERVAL`, and `OPEN_WEBUI_TIMEOUT`. CLI flags override `.env` values.
+**Configuration via `.env`:** Copy [`.env.example`](.env.example) to `.env` and fill in your values. The script automatically loads `OPEN_WEBUI_API_KEY`, `OPEN_WEBUI_BASE_URL`, `OPEN_WEBUI_MODEL`, `OPEN_WEBUI_TOOL_ID`, `OPEN_WEBUI_SKILL_ID`, and `OPEN_WEBUI_LOG`. CLI flags override `.env` values.
 
 ## 🗂️ Repository Structure
 
