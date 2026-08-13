@@ -370,12 +370,13 @@ def encode_image_data_uri(path: Path) -> str:
 def build_multimodal_content(text: str, image_data_uri: str) -> list:
     """
     Build the 'content' field for the user message as structured multimodal
-    parts (OpenAI vision format): a text part plus an inline image_url part.
+    parts (OpenAI vision format): an inline image_url part, plus a text part
+    only when a non-empty prompt is provided.
     """
-    return [
-        {"type": "text", "text": text},
-        {"type": "image_url", "image_url": {"url": image_data_uri}},
-    ]
+    parts = [{"type": "image_url", "image_url": {"url": image_data_uri}}]
+    if text and text.strip():
+        parts.insert(0, {"type": "text", "text": text})
+    return parts
 
 
 def _extract_thoughts(message: dict) -> str:
@@ -573,8 +574,7 @@ def run_chat(args: argparse.Namespace) -> int:
               f"({detect_mime_type(args.image)})")
 
         print("[2/3] Requesting chat completion with tools/skills ...")
-        default_text = args.text if args.text.strip() else "Describe this image."
-        user_content = build_multimodal_content(default_text, image_data_uri)
+        user_content = build_multimodal_content(args.text, image_data_uri)
         reply, thoughts = chat_completion(
             args.base_url,
             headers,
